@@ -1,8 +1,21 @@
 import threading
 import logging
+import os
+import sys
 from typing import Callable
 
-import pystray
+try:
+    import pystray
+except (ImportError, ValueError):
+    if sys.platform.startswith("linux"):
+        for key in list(sys.modules.keys()):
+            if key == "pystray" or key.startswith("pystray."):
+                del sys.modules[key]
+        os.environ["PYSTRAY_BACKEND"] = "xorg"
+        import pystray
+    else:
+        raise
+
 from PIL import Image, ImageDraw
 
 logging.getLogger("pystray").setLevel(logging.CRITICAL)

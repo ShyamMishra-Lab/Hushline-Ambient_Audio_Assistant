@@ -1,116 +1,111 @@
+import os
+import urllib.request
 import numpy as np
-import webrtcvad
+import onnxruntime as ort
 import config
 
 
 class VADEngine:
     """
-    Two-stage speech detector:
-      Stage 1 — webrtcvad: is this frame speech-shaped?
-      Stage 2 — spectral flatness: is this a hum? if so, reject it.
-
-    Both stages must pass for a frame to be confirmed as speech.
+    Neural Voice Activity Detector using Silero VAD v5 ONNX model.
+    Effectively rejects non-speech sounds like keyboard clicks, hums, and music.
     """
 
     def __init__(self, aggressiveness=2):
-        # webrtcvad instance — aggressiveness 0-3
         self.aggressiveness = aggressiveness
-        self.vad = webrtcvad.Vad(aggressiveness)
 
-        # spectral flatness threshold
-        # below this value = energy too concentrated = probably a hum
-        # 0.05 means "at least 5% as flat as pure white noise"
-        self.flatness_threshold = 0.05
+        model_dir = os.path.expanduser("~/.cache/hushline")
+        self.model_path = os.path.join(model_dir, "silero_vad.onnx")
+        self._ensure_model_exists()
 
-        # minimum zero crossing rate for speech
-        # hums have very low ZCR, speech has high ZCR
-        self.min_zcr = 0.02
+        # Load the ONNX model using CPUExecutionProvider
+        self.session = ort.InferenceSession(
+            self.model_path, providers=["CPUExecutionProvider"]
+        )
+        self.reset_state()
 
-    def _check_vad(self, audio_int16):
-        """
-        Ask webrtcvad if this frame contains speech.
-        Requires int16 PCM bytes — we convert from float32.
-        """
-        try:
-            return self.vad.is_speech(
-                audio_int16.tobytes(),
-                config.SAMPLE_RATE
-            )
-        except Exception:
-            return False
+    def reset_state(self):
+        # Silero VAD v5 expects an LSTM state of shape [2, 1, 128]
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        # Context window size is 64 samples for 16kHz
+        self._context = np.zeros((1, 64), dtype=np.float32)
 
-    def _check_not_hum(self, audio_float):
-        """
-        Returns True if the audio is NOT a hum.
-        Uses two independent checks — both must agree it's not a hum.
-        """
-
-        # --- SPECTRAL FLATNESS ---
-        # FFT gives us the frequency spectrum
-        spectrum = np.abs(np.fft.rfft(audio_float))
-
-        # avoid log(0) — add tiny value
-        spectrum = spectrum + 1e-10
-
-        # geometric mean — sensitive to spikes, pulled down by near-zeros
-        log_mean = np.mean(np.log(spectrum))
-        geometric_mean = np.exp(log_mean)
-
-        # arithmetic mean — not sensitive to distribution shape
-        arithmetic_mean = np.mean(spectrum)
-
-        # flatness ratio — close to 1 = spread out (speech), close to 0 = spiky (hum)
-        flatness = geometric_mean / arithmetic_mean
-
-        if flatness < self.flatness_threshold:
-            # energy too concentrated in one frequency — reject as hum
-            return False
-
-        # --- ZERO CROSSING RATE ---
-        # count how often the signal crosses zero
-        # speech: frequent crossings due to consonants
-        # hums: very few crossings — smooth sustained tone
-        signs = np.sign(audio_float)
-        crossings = np.sum(np.abs(np.diff(signs)) > 0)
-        zcr = crossings / len(audio_float)
-
-        if zcr < self.min_zcr:
-            # too smooth — likely a hum or sustained tone
-            return False
-
-        return True
+    def _ensure_model_exists(self):
+        if not os.path.exists(self.model_path):
+            os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+            urls = [
+                "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx",
+                "https://huggingface.co/onnx-community/silero-vad/resolve/main/onnx/silero_vad.onnx",
+                "https://huggingface.co/runanywhere/silero-vad-v5/resolve/main/silero_vad.onnx",
+            ]
+            success = False
+            last_err = None
+            for url in urls:
+                print(
+                    f"Downloading Silero VAD ONNX model (~1.8MB) from {url}...",
+                    flush=True,
+                )
+                try:
+                    urllib.request.urlretrieve(url, self.model_path)
+                    print("Download complete.", flush=True)
+                    success = True
+                    break
+                except Exception as e:
+                    print(f"Failed to download: {e}", flush=True)
+                    last_err = e
+            if not success:
+                print(
+                    "Error: All download attempts for Silero VAD model failed.",
+                    flush=True,
+                )
+                raise last_err
 
     def detect_speech(self, indata, volume_threshold):
         """
-        Main method — called every frame from the audio callback.
-
-        Returns True only if:
-          1. Volume is above threshold
-          2. webrtcvad confirms speech pattern
-          3. Spectral analysis confirms it's not a hum
-
-        indata          : numpy array shape (FRAME_SIZE, 1), float32
-        volume_threshold: float, from NoiseTracker.get_threshold()
+        Main method called every frame from the audio callback.
         """
-
-        # extract mono channel
         audio_float = indata[:, 0]
 
-        # --- GATE 1: volume ---
-        rms = np.sqrt(np.mean(audio_float ** 2)) * 1000
-        if rms < volume_threshold:
+        # --- GATE 1: volume floor check ---
+        # Skip neural inference only on dead silence to optimize CPU usage
+        rms = np.sqrt(np.mean(audio_float**2)) * 1000
+        if rms < 2.0:  # Very low threshold to filter out absolute silence only
             return False
 
-        # convert to int16 for webrtcvad
-        # webrtcvad expects 16-bit PCM, not float
-        audio_int16 = (audio_float * 32767).astype(np.int16)
+        # Ensure correct window size (512 samples)
+        if len(audio_float) != 512:
+            if len(audio_float) < 512:
+                audio_float = np.pad(
+                    audio_float, (0, 512 - len(audio_float)), "constant"
+                )
+            else:
+                audio_float = audio_float[:512]
 
-        # --- GATE 2: webrtcvad ---
-        if not self._check_vad(audio_int16):
+        # --- GATE 2: Peak Normalization for low-volume audio ---
+        # Scale frames with audio activity to standard training levels (0.55 peak)
+        max_val = np.max(np.abs(audio_float))
+        if max_val > 0.003:  # Only scale if above baseline noise gate
+            audio_float = audio_float * (0.55 / max_val)
+
+        audio_input = np.expand_dims(audio_float, axis=0).astype(np.float32)
+
+        # Silero VAD v5 requires appending a 64-sample context before the 512-sample frame
+        x = np.concatenate([self._context, audio_input], axis=1)
+
+        inputs = {
+            "input": x,
+            "state": self._state,
+            "sr": np.array(config.SAMPLE_RATE, dtype=np.int64),
+        }
+
+        try:
+            outputs = self.session.run(None, inputs)
+            speech_prob = outputs[0][0][0]
+            self._state = outputs[1]  # Save RNN state for next frame
+            self._context = x[:, -64:]  # Save last 64 samples as context for next frame
+
+            # Binary speech trigger threshold (>= 0.5 indicates human speech)
+            return speech_prob >= 0.5
+        except Exception as e:
+            print("VAD inference error:", e, flush=True)
             return False
-
-        # --- GATE 3: hum rejection ---
-        if not self._check_not_hum(audio_float):
-            return False
-
-        return True

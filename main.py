@@ -11,19 +11,20 @@ def ensure_single_instance():
     lock_file = os.path.join(tempfile.gettempdir(), "hushline.lock")
 
     try:
-        # try to create the lock file exclusively
-        # if it already exists and is locked, another instance is running
-        import msvcrt
-
-        lock = open(lock_file, 'w')
-        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        if sys.platform == "win32":
+            import msvcrt
+            lock = open(lock_file, 'w')
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            lock = open(lock_file, 'w')
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         # write our PID so we can identify the process
         lock.write(str(os.getpid()))
         lock.flush()
 
         # keep the lock file handle open for the lifetime of the process
-        # storing it prevents garbage collection from closing it
         sys._hushline_lock = lock
 
     except (IOError, OSError):
@@ -34,8 +35,11 @@ def ensure_single_instance():
 ensure_single_instance()
 
 
+# Add _MEIPASS directory to PATH on Windows so ctypes can locate PortAudio DLL (for sounddevice/PyInstaller)
+if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+    os.environ['PATH'] = sys._MEIPASS + os.pathsep + os.environ.get('PATH', '')
+
 import asyncio
-import os
 import threading
 import time
 
@@ -314,5 +318,9 @@ class AmbientApp:
         self.overlay.run()
 
 
-if __name__ == "__main__":
+def main():
     AmbientApp().run()
+
+
+if __name__ == "__main__":
+    main()
